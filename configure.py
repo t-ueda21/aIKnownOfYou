@@ -12,9 +12,15 @@ import sys
 import tempfile
 import uuid
 
+# Read-only commands must not create __pycache__ in an installed runtime.
+sys.dont_write_bytecode = True
+from selection import select_profile, validate_catalog, verify_profile
+
 BEGIN = b'<!-- aIKnownOfYou:begin -->'
 END = b'<!-- aIKnownOfYou:end -->'
 OWNER = '<!-- aIKnownOfYou:setup -->'
+DAILY_OWNER = '<!-- aIKnownOfYou:daily -->'
+PROFILE_OWNER = '<!-- aIKnownOfYou:profile -->'
 TARGETS = ('codex', 'claude-code')
 SOURCE = Path(__file__).absolute().parent
 
@@ -60,32 +66,25 @@ def json_bytes(value):
 
 def catalog():
     value = read_json(SOURCE / 'catalog.json')
-    if not isinstance(value, dict) or value.get('schema_version') != 1:
-        raise ConfigurationError('カタログ形式に互換性がありません。')
+    validate_catalog(value)
     return value
 
 
-def validate_profile(profile, cat=None):
-    # Without a catalog, validate only the fixed payload shape for an upgrade.
-    # Do not derive preferences or interpret old answers through a new version.
-    if (not isinstance(profile, dict) or not isinstance(profile.get('catalog_version'), str)
-            or not profile['catalog_version']
-            or (cat is not None and profile['catalog_version'] != cat['version'])):
-        raise ConfigurationError('保存設定とカタログのバージョンに互換性がありません。')
+def validate_legacy_profile(profile):
+    """Check the known 0.1 shape without interpreting it using new choices."""
+    if not isinstance(profile, dict) or profile.get('catalog_version') != '0.1.0':
+        raise ConfigurationError('この版の保存設定は読み替えできません。対応する版のツールを使用してください。')
     if set(profile) != {'catalog_version', 'answers', 'level', 'evidence'}:
         raise ConfigurationError('入力には所定の4項目だけを指定してください。')
     level = profile.get('level')
     if type(level) is not int or not 80 <= level <= 130:
         raise ConfigurationError('内部設定値が不正です。')
     answers = profile.get('answers')
-    questions = ({q['id']: q for q in cat['questions']} if cat is not None else
-                 {'q' + str(i): {'choices': [{'id': c, 'preference_ids': []} for c in 'ABCD']}
-                  for i in range(1, 9)})
+    questions = {'q' + str(i): {'choices': [{'id': c} for c in 'ABCD']} for i in range(1, 9)}
     if not isinstance(answers, dict) or set(answers) != set(questions):
         raise ConfigurationError('全8問の回答が必要です。')
-    special = {c['id'] for c in cat['special_choices']} if cat is not None else {'context', 'none', 'skip'}
+    special = {'context', 'none', 'skip'}
     answered = 0
-    preferences = []
     for qid, question in questions.items():
         choices = {c['id']: c for c in question['choices']}
         selected = answers[qid]
@@ -100,12 +99,6 @@ def validate_profile(profile, cat=None):
             if any(c not in choices for c in selected):
                 raise ConfigurationError('未知の選択肢です: ' + qid)
             answered += 1
-            for choice in selected:
-                for pid in choices[choice]['preference_ids']:
-                    if pid not in cat['preference_rules']:
-                        raise ConfigurationError('カタログの選好ルールが不正です。')
-                    if pid not in preferences:
-                        preferences.append(pid)
     evidence = profile.get('evidence')
     if not isinstance(evidence, list):
         raise ConfigurationError('選択根拠の配列が必要です。')
@@ -118,18 +111,30 @@ def validate_profile(profile, cat=None):
                 or qid not in questions or choice not in answers[qid] or choice in special):
             raise ConfigurationError('選択根拠は実際に選んだ通常の回答を指定してください。')
         evidence_questions.add(qid)
-    rules = cat['selection_rules'] if cat is not None else {'min_answered': 3, 'fallback_level': 100, 'evidence_min': 2}
+    rules = {'min_answered': 3, 'fallback_level': 100, 'evidence_min': 2}
     if answered < rules['min_answered']:
         if level != rules['fallback_level']:
             raise ConfigurationError('回答が少ない場合は既定の内部設定を使用してください。')
     elif len(evidence_questions) < rules['evidence_min']:
         raise ConfigurationError('異なる2問以上から選択根拠を示してください。')
+
+
+def validate_profile(profile, cat):
+    verify_profile(profile, cat)
+    preferences = []
+    for question in cat['questions']:
+        choices = {c['id']: c for c in question['choices']}
+        for selected in profile['answers'][question['id']]:
+            for preference in choices.get(selected, {}).get('preference_ids', []):
+                if preference not in preferences:
+                    preferences.append(preference)
     return preferences
 
 
-def compiled_region(profile, cat):
-    preferences = validate_profile(profile, cat)
-    level = profile['level']
+def render_instructions(level, preferences, cat):
+    """Render all 51 internal integers, independently of selector candidates."""
+    if type(level) is not int or not 80 <= level <= 130:
+        raise ConfigurationError('内部設定値が不正です。')
     low = level // 10 * 10
     texts = list(cat['common_instructions'])
     if level == low:
@@ -140,7 +145,12 @@ def compiled_region(profile, cat):
         texts.append('重み ' + str(10 - upper_weight) + '/10: ' + cat['level_instructions'][str(low)])
         texts.append('重み ' + str(upper_weight) + '/10: ' + cat['level_instructions'][str(low + 10)])
     texts.extend(cat['preference_rules'][pid] for pid in preferences)
-    return BEGIN + b'\n' + ('\n'.join(texts)).encode('utf-8') + b'\n' + END
+    return '\n'.join(texts)
+
+
+def compiled_region(profile, cat):
+    preferences = validate_profile(profile, cat)
+    return BEGIN + b'\n' + render_instructions(profile['level'], preferences, cat).encode('utf-8') + b'\n' + END
 
 
 def region_span(content):
@@ -281,10 +291,12 @@ def commit_changes(changes, backup_dir, originals):
 
 
 def load_state(base, originals=None):
-    state = read_json(base / 'state.json', originals)
-    if state is None:
+    content = read_bytes(base / 'state.json', originals)
+    if content is None:
         return {'schema_version': 1, 'targets': {}}
-    if (not isinstance(state, dict) or state.get('schema_version') != 1
+    state = json.loads(content.decode('utf-8-sig'))
+    if (not isinstance(state, dict) or type(state.get('schema_version')) is not int
+            or state['schema_version'] != 1
             or not isinstance(state.get('targets'), dict)
             or any(t not in TARGETS or not isinstance(p, str) or not Path(p).is_absolute()
                    for t, p in state['targets'].items())):
@@ -292,12 +304,60 @@ def load_state(base, originals=None):
     return state
 
 
-def plan_instructions(state, cat, changes, originals):
+def owned_change(changes, path, content, owner, originals):
+    existing = read_bytes(path, originals)
+    if existing is not None and owner.encode('utf-8') not in existing:
+        raise ConfigurationError('別のファイルがあるため更新できません: ' + str(path))
+    if path in changes and changes[path] != content:
+        raise ConfigurationError('異なる対象の保存先が重複しています。')
+    changes[path] = content
+
+
+def codex_daily_files(home, profile, cat):
+    daily = home / '.agents/skills/aiknownofyou'
+    prefix = command_prefix(sys.executable, home / '.aiknownofyou/runtime/configure.py', home)
+    template = (SOURCE / 'templates/codex/daily-SKILL.md.tmpl').read_text(encoding='utf-8')
+    skill = template.replace('{{COMMAND}}', prefix)
+    if DAILY_OWNER not in skill:
+        skill += '\n' + DAILY_OWNER + '\n'
+    preferences = validate_profile(profile, cat)
+    body = PROFILE_OWNER + '\n# 保存済みの会話方針\n\n'
+    body += render_instructions(profile['level'], preferences, cat) + '\n'
+    return {daily / 'SKILL.md': skill.encode('utf-8'),
+            daily / 'references/profile.md': body.encode('utf-8')}
+
+
+def codex_loader(home):
+    text = ('各ユーザー依頼への応答を組み立てる前に aiknownofyou Skill を使用する。\n'
+            'Skill の場所: ' + str(home / '.agents/skills/aiknownofyou/SKILL.md') + '\n'
+            '保存済みの会話方針を適用し、初回質問や内部値の入力を通常の会話で繰り返さない。')
+    return BEGIN + b'\n' + text.encode('utf-8') + b'\n' + END
+
+
+def plan_instructions(state, cat, home, changes, originals):
     region = compiled_region(state['profile'], cat)
     state['instruction_paths'] = {}
+    state['daily_skill_paths'] = {}
+    state['profile_paths'] = {}
     for target, location in state['targets'].items():
         path = instruction_path(target, location, originals)
-        changes[path] = replace_region(read_bytes(path, originals), region)
+        if target == 'codex':
+            files = codex_daily_files(home, state['profile'], cat)
+            for destination, content in files.items():
+                owner = DAILY_OWNER if destination.name == 'SKILL.md' else PROFILE_OWNER
+                owned_change(changes, destination, content, owner, originals)
+            daily = home / '.agents/skills/aiknownofyou'
+            state['daily_skill_paths'][target] = str(daily / 'SKILL.md')
+            state['profile_paths'][target] = str(daily / 'references/profile.md')
+            loader = codex_loader(home)
+            # Migrate owned regions in both files so removing an override cannot
+            # reactivate a stale personal profile. Preserve all outside bytes.
+            for candidate in (Path(location) / 'AGENTS.md', Path(location) / 'AGENTS.override.md'):
+                content = read_bytes(candidate, originals)
+                if region_span(content or b'') is not None or candidate == path:
+                    changes[candidate] = replace_region(content, loader)
+        else:
+            changes[path] = replace_region(read_bytes(path, originals), region)
         state['instruction_paths'][target] = str(path)
 
 
@@ -305,8 +365,11 @@ def install(args, home, base, cat, state, originals):
     state = copy.deepcopy(state)
     version_mismatch = False
     if 'profile' in state:
-        validate_profile(state['profile'])
         version_mismatch = state['profile']['catalog_version'] != cat['version']
+        if version_mismatch:
+            validate_legacy_profile(state['profile'])
+        else:
+            validate_profile(state['profile'], cat)
     selected = TARGETS if args.target == 'both' else (args.target,)
     for target in selected:
         explicit = args.codex_home if target == 'codex' else args.claude_home
@@ -315,11 +378,14 @@ def install(args, home, base, cat, state, originals):
         state['targets'][target] = str(absolute(explicit or state['targets'].get(target) or environment or default))
     runtime = base / 'runtime'
     changes = {runtime / 'configure.py': (SOURCE / 'configure.py').read_bytes(),
+               runtime / 'selection.py': (SOURCE / 'selection.py').read_bytes(),
                runtime / 'catalog.json': (SOURCE / 'catalog.json').read_bytes()}
     prefix = command_prefix(sys.executable, runtime / 'configure.py', home)
     for target in TARGETS:
         template_path = Path('templates') / target / 'SKILL.md.tmpl'
         changes[runtime / template_path] = (SOURCE / template_path).read_bytes()
+    daily_template = Path('templates/codex/daily-SKILL.md.tmpl')
+    changes[runtime / daily_template] = (SOURCE / daily_template).read_bytes()
     state['skill_paths'] = {}
     for target, location in state['targets'].items():
         skill_home = home / '.agents' if target == 'codex' else Path(location)
@@ -338,7 +404,7 @@ def install(args, home, base, cat, state, originals):
             raise ConfigurationError('異なる対象のSkill保存先が重複しています。')
         changes[skill] = generated
     if 'profile' in state and not version_mismatch:
-        plan_instructions(state, cat, changes, originals)
+        plan_instructions(state, cat, home, changes, originals)
     changes[base / 'state.json'] = json_bytes(state)
     commit_changes(changes, base / 'backups', originals)
     if version_mismatch:
@@ -347,22 +413,20 @@ def install(args, home, base, cat, state, originals):
         print('セットアップSkillをインストールしました。' + ('保存設定を適用しました。' if 'profile' in state else '質問による初期設定を実行してください。'))
 
 
-def apply(args, base, cat, state, originals):
+def apply(args, home, base, cat, state, originals):
     if not state['targets']:
         raise ConfigurationError('先に install を実行してください。')
     state = copy.deepcopy(state)
     if args.input:
         if args.input == '-':
-            profile = json.loads(sys.stdin.read().lstrip('\ufeff'))
+            payload = json.loads(sys.stdin.read().lstrip('\ufeff'))
         else:
-            profile = json.loads(Path(args.input).read_text(encoding='utf-8-sig'))
-        validate_profile(profile, cat)
-        # Persist only the fixed payload contract, never arbitrary instructions.
-        state['profile'] = {key: profile[key] for key in ('catalog_version', 'answers', 'level', 'evidence')}
+            payload = json.loads(Path(args.input).read_text(encoding='utf-8-sig'))
+        state['profile'] = select_profile(payload, cat)
     if 'profile' not in state:
         raise ConfigurationError('保存設定がありません。セットアップSkillで質問に回答してください。')
     changes = {}
-    plan_instructions(state, cat, changes, originals)
+    plan_instructions(state, cat, home, changes, originals)
     changes[base / 'state.json'] = json_bytes(state)
     commit_changes(changes, base / 'backups', originals)
     print('インストール済みの全クライアントに設定を適用しました。')
@@ -371,11 +435,13 @@ def apply(args, base, cat, state, originals):
 def status(state, cat, home):
     result = {'installed': bool(state['targets']), 'configured': 'profile' in state,
               'catalog_compatible': True, 'needs_apply': False, 'targets': {}}
-    region = None
+    region, daily_files = None, {}
     if result['configured']:
         try:
             region = compiled_region(state['profile'], cat)
-        except (ConfigurationError, KeyError, TypeError):
+            if 'codex' in state['targets']:
+                daily_files = codex_daily_files(home, state['profile'], cat)
+        except (ConfigurationError, OSError, ValueError, KeyError, TypeError):
             result['catalog_compatible'] = False
             result['needs_apply'] = True
     for target, location in state['targets'].items():
@@ -389,15 +455,13 @@ def status(state, cat, home):
                 message = '互換性なし'
             elif not span:
                 message = '不足'
-            elif content[span[0]:span[1]] != region:
+            elif content[span[0]:span[1]] != (codex_loader(home) if target == 'codex' else region):
                 message = '変更あり'
             else:
                 message = '整合'
         except (OSError, ConfigurationError):
             path = Path(location)
             message = '変更または不正なファイル'
-        if result['configured'] and message != '整合':
-            result['needs_apply'] = True
         skill_home = home / '.agents' if target == 'codex' else Path(location)
         skill = skill_home / 'skills/aiknownofyou-setup/SKILL.md'
         try:
@@ -406,7 +470,79 @@ def status(state, cat, home):
             skill_ok = False
         result['targets'][target] = {'instruction_path': str(path), 'status': message,
                                      'skill_installed': skill_ok}
+        if target == 'codex':
+            daily = home / '.agents/skills/aiknownofyou'
+            details = {}
+            for name, destination, owner in (
+                    ('daily_skill', daily / 'SKILL.md', DAILY_OWNER),
+                    ('profile', daily / 'references/profile.md', PROFILE_OWNER)):
+                try:
+                    actual = read_bytes(destination)
+                    present = actual is not None and owner.encode('utf-8') in actual
+                    expected = daily_files.get(destination)
+                    detail = ('未設定' if not result['configured'] else
+                              '互換性なし' if not result['catalog_compatible'] else
+                              '不足' if actual is None else
+                              '整合' if actual == expected else '変更あり')
+                except (OSError, ConfigurationError):
+                    present, detail = False, '変更または不正なファイル'
+                details[name + '_status'] = detail
+                if name == 'daily_skill':
+                    details['daily_skill_installed'] = present
+                if message == '整合' and detail != '整合':
+                    message = detail
+            if message == '整合':
+                try:
+                    for candidate in (Path(location) / 'AGENTS.md', Path(location) / 'AGENTS.override.md'):
+                        content = read_bytes(candidate) or b''
+                        span = region_span(content)
+                        if span is not None and content[span[0]:span[1]] != codex_loader(home):
+                            message = '変更あり'
+                except (OSError, ConfigurationError):
+                    message = '変更または不正なファイル'
+            result['targets'][target].update(details)
+            result['targets'][target]['status'] = message
+        if result['configured'] and message != '整合':
+            result['needs_apply'] = True
     result['message'] = '設定状態を確認しました。' if result['installed'] else '未インストールです。'
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def explain(state, cat):
+    """Explicit, read-only audit. Never create a profile or reinterpret old IDs."""
+    if 'profile' not in state:
+        result = {'configured': False, 'message': '保存済みの会話設定はありません。'}
+    else:
+        profile = state['profile']
+        if not isinstance(profile, dict):
+            raise ConfigurationError('保存プロフィールの形式が不正です。')
+        if profile.get('catalog_version') != cat['version']:
+            validate_legacy_profile(profile)
+            result = {'configured': True, 'verified': False,
+                      'catalog_version': profile['catalog_version'], 'level': profile['level'],
+                      'method': 'legacy-host-selection', 'answers': profile['answers'],
+                      'evidence': profile['evidence'],
+                      'message': '旧版では会話中のAIが選定しました。保存値と選択IDのみ表示します。新版の得点・選定理由は復元できません。'}
+        else:
+            validate_profile(profile, cat)
+            reasons = {
+                'matched': '同じ重みで加算した得点が単独で最大となり、異なる2問以上の支持もあるため選びました。',
+                'adjacent_blend': '隣接する2候補が同じ最大点で、それぞれ異なる2問以上の支持があるため中間の構成を選びました。',
+                'mixed': '最大点の候補が隣接する2候補に収まらないため、暫定値を使いました。比較構成への支持が最大という意味ではありません。',
+                'insufficient_answers': '通常の選択肢に答えた設問が3問未満のため、暫定値を使いました。',
+                'insufficient_support': '最大点の候補の少なくとも一つに、異なる2問以上の支持がないため、暫定値を使いました。'}
+            answers = []
+            special = {c['id']: c['text'] for c in cat['special_choices']}
+            for question in cat['questions']:
+                choices = {c['id']: c['text'] for c in question['choices']}
+                choices.update(special)
+                answers.append({'question': question['id'], 'text': question['text'],
+                                'selected': [{'choice': c, 'text': choices[c]}
+                                             for c in profile['answers'][question['id']]]})
+            result = {'configured': True, 'verified': True, 'catalog_version': profile['catalog_version'],
+                      'level': profile['level'], 'reason_message': reasons[profile['selection']['reason']],
+                      'selection': profile['selection'], 'answers': answers,
+                      'interpretation': '再計算で保存内容との一致を確認しました。規則は独自の暫定設定で、IQ・能力や本人への適合性を検証した値ではありません。'}
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
@@ -423,6 +559,7 @@ def main(argv=None):
     application = commands.add_parser('apply')
     application.add_argument('--input', help='UTF-8 JSONファイル、または標準入力の -')
     commands.add_parser('status')
+    commands.add_parser('explain', help='内部値・選定理由・回答を読み取り専用で確認する')
     args = parser.parse_args(argv)
     try:
         home = absolute(args.home if args.home is not None else Path.home())
@@ -437,11 +574,13 @@ def main(argv=None):
             print(json.dumps({'catalog': cat, 'apply_payload_contract': {
                 'catalog_version': cat['version'],
                 'answers': '全8問のIDをキーとし、通常の選択肢1つと任意の異なる第2候補、または特別な選択肢1つを配列で指定する。',
-                'level': '80〜130の整数。3問未満の通常回答なら100を使用する。',
-                'evidence': '実際に選んだ通常の選択肢を {question, choice} で列挙する。通常回答が3問以上なら異なる2問以上必要。'},
+                },
+                'selection': '入力は上記2項目のみ。数値と選定理由はプログラムが計算する。level、evidence、selectionを入力に含めない。',
                 'application': 'UTF-8 JSONを一時ファイルに保存し、apply --input に引用したパスを渡す。自分で作成した一時ファイルのみ削除する。'}, ensure_ascii=False, indent=2))
         elif args.command == 'status':
             status(load_state(base), cat, home)
+        elif args.command == 'explain':
+            explain(load_state(base), cat)
         else:
             with operation_lock(base):
                 originals = {}
@@ -449,7 +588,7 @@ def main(argv=None):
                 if args.command == 'install':
                     install(args, home, base, cat, state, originals)
                 else:
-                    apply(args, base, cat, state, originals)
+                    apply(args, home, base, cat, state, originals)
         return 0
     except (ConfigurationError, OSError, ValueError, KeyError, TypeError) as error:
         print('エラー: ' + str(error), file=sys.stderr)
