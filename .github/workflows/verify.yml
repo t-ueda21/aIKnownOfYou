@@ -1,0 +1,101 @@
+name: Verify local setup
+
+on:
+  push:
+    branches: [main, 'verify/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.10', '3.13']
+    env:
+      PYTHONUTF8: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run existing regression tests
+        run: python -m unittest discover -s tests -v
+      - name: Verify isolated install and apply
+        shell: python
+        run: |
+          import json
+          from pathlib import Path
+          import subprocess
+          import sys
+          import tempfile
+
+          source = Path.cwd()
+          catalog = json.loads((source / 'catalog.json').read_text(encoding='utf-8'))
+          with tempfile.TemporaryDirectory(prefix='aiknownofyou smoke ') as temporary:
+              home = Path(temporary) / '日本語 home'
+              home.mkdir()
+              agents = home / '.codex' / 'AGENTS.md'
+              agents.parent.mkdir()
+              existing = '\ufeff# 既存の個人指示\r\n必ず既存の設定を保持する。\r\n'.encode('utf-8')
+              agents.write_bytes(existing)
+
+              def run(script, *arguments):
+                  result = subprocess.run(
+                      [sys.executable, str(script), '--home', str(home), *arguments],
+                      text=True, encoding='utf-8', capture_output=True,
+                  )
+                  if result.returncode:
+                      raise RuntimeError(result.stdout + result.stderr)
+                  return result.stdout
+
+              run(source / 'configure.py', 'install', '--target', 'codex')
+              runtime = home / '.aiknownofyou' / 'runtime' / 'configure.py'
+              assert runtime.is_file(), 'Installed runtime missing'
+              assert not (home / '.claude').exists(), 'Codex-only install touched Claude settings'
+              assert agents.read_bytes() == existing, 'Install changed existing instructions before setup'
+              initial = json.loads(run(runtime, 'status'))
+              assert initial['installed'] and not initial['configured'], initial
+
+              # Synthetic answers only. Do not use a person's responses in CI.
+              payload = {
+                  'catalog_version': catalog['version'],
+                  'answers': {question['id']: [question['choices'][0]['id']]
+                              for question in catalog['questions']},
+              }
+              answers = home / 'synthetic answers.json'
+              answers.write_text(json.dumps(payload), encoding='utf-8')
+              run(runtime, 'apply', '--input', str(answers))
+              applied = agents.read_bytes()
+              assert applied.startswith(existing), 'Existing instructions were not preserved byte-for-byte'
+              assert applied.count(b'<!-- aIKnownOfYou:begin -->') == 1
+              assert applied.count(b'<!-- aIKnownOfYou:end -->') == 1
+              profile = home / '.agents/skills/aiknownofyou/references/profile.md'
+              assert profile.is_file(), 'Daily profile missing'
+              assert (profile.parent.parent / 'SKILL.md').is_file(), 'Daily Skill missing'
+              status = json.loads(run(runtime, 'status'))
+              assert status['configured'] and status['catalog_compatible'], status
+              assert not status['needs_apply'], status
+              assert status['targets']['codex']['status'] == '整合', status
+              assert 'level' not in status and 'answers' not in status
+
+              saved_profile = profile.read_bytes()
+              run(runtime, 'apply')
+              assert agents.read_bytes() == applied, 'Reapply duplicated or changed the managed region'
+              assert profile.read_bytes() == saved_profile, 'Reapply changed the saved profile'
+              assert not json.loads(run(runtime, 'status'))['needs_apply']
+              print('PASS: Codex-only install, Unicode path, existing bytes, setup, status, and reapply')
