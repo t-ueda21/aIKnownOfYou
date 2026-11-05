@@ -103,15 +103,35 @@ class ConfigureTests(unittest.TestCase):
         self.assertTrue(json.loads(self.run_cli('status').stdout)['targets']['codex']['daily_skill_installed'])
 
     def test_install_is_self_contained_and_defaults_to_both(self):
+        self.home = self.base / "user's 日本 space"
         self.run_cli('install')
         runtime = self.home / '.aiknownofyou/runtime'
         self.assertTrue((runtime / 'templates/codex/SKILL.md.tmpl').is_file())
         self.assertEqual(set(self.state()['targets']), {'codex', 'claude-code'})
-        command = (self.home / '.agents/skills/aiknownofyou-setup/SKILL.md').read_text().splitlines()[3]
-        tokens = shlex.split(command)
-        self.assertEqual(tokens, [sys.executable, str(runtime / 'configure.py'), '--home', str(self.home), 'guide'])
+        skills = [self.home / '.agents/skills/aiknownofyou-setup/SKILL.md',
+                  self.home / '.claude/skills/aiknownofyou-setup/SKILL.md']
+        commands = [skill.read_text(encoding='utf-8').splitlines()[3] for skill in skills]
+        expected = [sys.executable, str(runtime / 'configure.py'), '--home', str(self.home)]
         shutil.rmtree(self.source)
-        self.run_cli('guide', script=runtime / 'configure.py')
+        for skill, command in zip(skills, commands):
+            with self.subTest(skill=str(skill)):
+                if os.name == 'nt':
+                    # PowerShell is not POSIX: keep its invocation operator and
+                    # doubled apostrophes, then execute the actual generated line.
+                    quoted = ' '.join("'" + part.replace("'", "''") + "'" for part in expected)
+                    self.assertEqual(command, '& ' + quoted + ' guide')
+                    shell = shutil.which('pwsh') or shutil.which('powershell')
+                    self.assertIsNotNone(shell, 'PowerShell is required to verify the Windows Skill command')
+                    utf8 = '$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); '
+                    invocation = [shell, '-NoLogo', '-NoProfile', '-NonInteractive',
+                                  '-Command', utf8 + command + '; exit $LASTEXITCODE']
+                else:
+                    self.assertEqual(shlex.split(command), expected + ['guide'])
+                    invocation = ['/bin/sh', '-c', command]
+                result = subprocess.run(invocation, cwd=self.base, capture_output=True,
+                                        text=True, encoding='utf-8', timeout=30)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(json.loads(result.stdout)['catalog'], fixture_catalog())
         self.run_cli('install', script=runtime / 'configure.py')
 
     def test_apply_preserves_bytes_and_interpolates_without_exposing_level(self):
